@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Tiny5&display=swap" rel="stylesheet">
+    <title>Chat</title>
+</head>
+<body>
+    <div id="root">
+        <form v-if="stage === 'init'" class="form" @submit.prevent="connect">
+            <h2>Chat room</h2>
+            <label>
+                Room code
+                <input v-model="enteredRoomCode">
+            </label>
+            <label>
+                Room passcode
+                <input v-model="enteredRoomPasscode">
+            </label>
+            <button type="submit">Connect</button>
+            <br>
+            <button @click="create">Create room</button>
+        </form>
+        <div v-if="stage === 'loading'" class="form">
+            Loading
+        </div>
+        <div v-if="stage === 'room-code'" class="form">
+            <div>
+                Room code: {{ roomCode }}
+            </div>
+            <div>
+                Room passcode: {{ roomPasscode }}
+            </div>
+        </div>
+        <div v-if="stage === 'call'" class="form">
+            <h2>Call</h2>
+            <audio ref="audio" autoplay></audio>
+            <button @click="joinVoice">Join voice chat</button>
+        </div>
+    </div>
+    <script>
+        const encoder = new TextEncoder();
+        const decoder = new TextDecoder();
+
+        const IV_LENGTH = 8;
+
+        const generateECDH = () => {
+            return crypto.subtle.generateKey(
+                {
+                    name: 'ECDH',
+                    namedCurve: 'P-256',
+                },
+                true,
+                ['deriveKey'],
+            )
+        }
+
+        const deriveKey = async (passcode) => {
+            return crypto.subtle.deriveKey(
+                {
+                    name: "PBKDF2",
+                    salt: Uint8Array.from([162, 239, 101, 60, 42, 60, 57, 166, 207, 22, 120, 100, 25, 17, 253, 0]),
+                    iterations: 10000,
+                    hash: "SHA-256",
+                },
+                await crypto.subtle.importKey(
+                    "raw",
+                    new TextEncoder().encode(passcode),
+                    "PBKDF2",
+                    false,
+                    ["deriveKey"]
+                ),
+                { name: "AES-GCM", length: 128 },
+                true,
+                ["encrypt", "decrypt"]
+            )
+        }
+
+        /**
+         * @type {() => Promise<{ ws: WebSocket, code: string, passcode: string, tempoKey: CryptoKey }>}
+         */
+        const createRoom = () => new Promise((resolve, reject) => {
+            const ws = new WebSocket("/signaling", "wss");
+            ws.binaryType = "arraybuffer";
+
+            const messageHandling = async ({ data }) => {
+                ws.removeEventListener('message', messageHandling);
+
+                const passcode = crypto.getRandomValues(new Uint8Array(3)).join(".");
+
+                resolve({
+                    ws,
+                    code: data,
+                    passcode,
+                    tempoKey: await deriveKey(passcode)
+                });
+            }
+
+            ws.addEventListener('message', messageHandling);
+
+            ws.onclose = (ev) => {
+                reject();
+            }
+        });
+
+        /**
+         * @returns {Promise<WebSocket>}
+         */
+        const connectToRoom = (code, message) => new Promise((resolve, reject) => {
+            const ws = new WebSocket(`/signaling?room=${code}`, "wss");
+            ws.binaryType = "arraybuffer";
+
+            ws.onopen = () => {
+                ws.send(message);
+            }
+            
+            ws.onmessage = ({ data }) => {
+                const text = new TextDecoder().decode(data);
+                if(text === "correct") {
+                    resolve(ws);
+                } else {
+                    reject();
+                }
+            }
+
+            ws.onclose = () => {
+                reject();
+            }
+        })
+
+        const waitForWSMessage = (ws) => new Promise((resolve, reject) => {
+            const handler = (ev) => {
+                ws.removeEventListener('message', handler);
+                resolve(ev.data);
+            }
+
+            ws.addEventListener('message', handler);
+        })
+
+        const waitForWSEncryptedMessage = async (ws, key) => {
+            const encryptedMessage = await waitForWSMessage(ws);
+            if(!(encryptedMessage instanceof ArrayBuffer)) throw new Error("Not buffer");
+
+            const iv = new Uint8Array(encryptedMessage.slice(0, IV_LENGTH));
+            const payload = new Uint8Array(encryptedMessage.slice(IV_LENGTH));
+
+            return crypto.subtle.decrypt(
+                { name: "AES-GCM", iv },
+                key,
+                payload
+            );
+        }
+
+        const waitForWSEncryptedJSON = async (ws, key) => {
+            const message = await waitForWSEncryptedMessage(ws, key);
+
+            return JSON.parse(decoder.decode(message));
+        }
+
+        const sendWSEncryptedMessage = async (ws, key, message) => {
+            const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+            const encrypted = new Uint8Array(await crypto.subtle.encrypt(
+                { name: "AES-GCM", iv },
+                key,
+                message
+            ))
+
+            const payload = new Uint8Array(iv.length + encrypted.length);
+            payload.set(iv, 0);
+            payload.set(encrypted, iv.length);
+
+            ws.send(payload);
+        }
+
+        const sendWSEncryptedJSON = async (ws, key, data) => sendWSEncryptedMessage(ws, key, encoder.encode(JSON.stringify(data)));
+
+        const createPC = async () => {
+            const credentials = await fetch("/credentials");
+            const { username, password, server } = await credentials.json();
+
+            const pc = new RTCPeerConnection({
+                iceServers: [
+                    { urls: server, username, credential: password }
+                ]
+            })
+            
+            return pc;
+        }
+
+        const gatherCandidates = (pc) => new Promise((resolve, reject) => {
+            const result = [];
+
+            pc.addEventListener('icecandidate', (e) => {
+                if(e.candidate) {
+                    result.push(e.candidate);
+                }
+            })
+
+            pc.addEventListener('icegatheringstatechange', (e) => {
+                switch(e.target.iceGatheringState) {
+                    case "gathering":
+                        return;
+
+                    case "complete":
+                        resolve(result);
+                        return;
+                }
+            })
+        })
+
+        Vue.createApp({
+            data() {
+                return {
+                    stage: "init",
+                    roomCode: null,
+                    roomPasscode: null,
+                    enteredRoomCode: "",
+                    enteredRoomPasscode: "",
+                }
+            },
+            methods: {
+                async create() {
+                    console.log("CREATING ROOM");
+                    const [{ code, ws, passcode, tempoKey }, { privateKey, publicKey }] = await Promise.all([
+                        createRoom(),
+                        generateECDH()
+                    ])
+
+                    console.log("ROOM CREATED", {
+                        code, passcode, tempoKey, privateKey, publicKey
+                    });
+
+                    this.stage = "room-code";
+                    this.roomCode = code;
+                    this.roomPasscode = passcode;
+
+                    let theirPublicKey;
+                    console.log("WAITING FOR THE OTHER SIDE");
+                    try {
+                        while(true) {
+                            const theirPublicKeyRaw = await waitForWSEncryptedMessage(ws, tempoKey);
+
+                            theirPublicKey = await crypto.subtle.importKey(
+                                "spki",
+                                theirPublicKeyRaw,
+                                {
+                                    name: "ECDH", namedCurve: 'P-256'
+                                },
+                                true,
+                                [],
+                            )
+
+                            console.log("    CORRECT");
+                            ws.send("correct");
+                            break;
+                        }
+                    } catch(e) {
+                        console.log("   FAILED AUTH ATTEMPT")
+                    }
+
+                    this.stage = "loading";
+
+                    console.log("OTHER SIDE CONFIRM", theirPublicKey);
+
+                    const sessionKey = await crypto.subtle.deriveKey(
+                        {
+                            name: 'ECDH',
+                            public: theirPublicKey,
+                        },
+                        privateKey,
+                        {
+                            name: 'AES-GCM',
+                            length: 256,
+                        },
+                        true,
+                        ['encrypt', 'decrypt'],
+                    )
+
+                    await sendWSEncryptedMessage(ws, tempoKey, await crypto.subtle.exportKey("spki", publicKey));
+
+                    console.log("SESSION ESTABLISHED", sessionKey);
+
+                    const pc = await createPC();
+                    const audioTransceiver = pc.addTransceiver("audio");
+
+
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    const ownCandidates = await gatherCandidates(pc);
+
+                    console.log("OFFER CREATED, CANDIDATES GATHERED", offer, ownCandidates);
+
+                    await sendWSEncryptedJSON(ws, sessionKey, {
+                        offer,
+                        candidates: ownCandidates
+                    });
+
+                    const { answer, candidates } = await waitForWSEncryptedJSON(ws, sessionKey);
+
+                    console.log("ANSWER AND CANDIDATES RECEIVED", { answer, candidates });
+
+                    await pc.setRemoteDescription(answer);
+                    candidates.forEach(candidate => pc.addIceCandidate(candidate));
+
+
+                    console.log("WAITING FOR PC CONNECTION")
+
+                    await new Promise((resolve, reject) => {
+                        pc.onconnectionstatechange = (e) => {
+                            if(pc.connectionState === "connected") resolve();
+                            if(pc.connectionState === "failed") reject();
+                        }
+                    })
+
+                    console.log("RTC ESTABLISHED");
+
+                    this.stage = "call";
+                    this.ws = ws;
+                    this.pc = pc;
+                    this.audioTransceiver = audioTransceiver;
+                },
+                async connect() {
+                    if(!this.enteredRoomCode || !this.enteredRoomPasscode) return;
+                    this.stage = "loading";
+
+                    console.log("STARTING CONNECTION");
+                    const code = this.enteredRoomCode;
+                    const passcode = this.enteredRoomPasscode;
+                    
+                    const tempoKey = await deriveKey(passcode);
+
+                    const { privateKey, publicKey } = await generateECDH();
+
+                    console.log("KEYS GENERATED", {
+                        publicKey,
+                        privateKey,
+                    })
+
+                    const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+
+                    const payload = new Uint8Array(await crypto.subtle.encrypt(
+                        {
+                            name: "AES-GCM",
+                            iv,
+                        },
+                        tempoKey,
+                        await crypto.subtle.exportKey("spki", publicKey)
+                    ))
+
+                    const message = new Uint8Array(iv.length + payload.byteLength);
+                    message.set(iv, 0);
+                    message.set(payload, iv.length);
+                        
+                    console.log("CONNECTING", {
+                        code, 
+                        passcode,
+                        tempoKey,
+                        iv,
+                        payload,
+                        message
+                    });
+
+                    const ws = await connectToRoom(code, message);
+                    
+                    console.log("CONNECTED...WAITING FOR THE OTHER SIDE KEY");
+
+                    const theirPubKey = await crypto.subtle.importKey(
+                        "spki",
+                        await waitForWSEncryptedMessage(ws, tempoKey),
+                        {
+                            name: "ECDH", namedCurve: 'P-256'
+                        },
+                        true,
+                        [],
+                    );
+
+                    console.log("RECEIVED PUB KEY", theirPubKey);
+
+                    await sendWSEncryptedMessage(ws, tempoKey, await crypto.subtle.exportKey("spki", publicKey));
+
+                    const sessionKey = await crypto.subtle.deriveKey(
+                        {
+                            name: 'ECDH',
+                            public: theirPubKey,
+                        },
+                        privateKey,
+                        {
+                            name: 'AES-GCM',
+                            length: 256,
+                        },
+                        true,
+                        ['encrypt', 'decrypt'],
+                    )
+
+                    console.log("SESSION ESTABLISHED", sessionKey);
+
+                    const pc = await createPC();
+                    const audioTransceiver = pc.addTransceiver("audio");
+
+                    console.log("WAITING FOR OFFER");
+
+                    const { offer, candidates } = await waitForWSEncryptedJSON(ws, sessionKey)
+
+                    console.log("OFFER AND CANDIDATES RECEIVED", offer, candidates);
+
+                    await pc.setRemoteDescription(offer);
+
+                    candidates.forEach(candidate => pc.addIceCandidate(candidate));
+
+                    const answer = await pc.createAnswer();
+                    console.log("ANSWER CREATED", answer);
+                    
+                    await pc.setLocalDescription(answer);
+                    const ownCandidates = await gatherCandidates(pc);
+                    
+                    console.log("CANDIDATES GATHERED", ownCandidates);
+
+                    await sendWSEncryptedJSON(ws, sessionKey, {
+                        answer,
+                        candidates: ownCandidates
+                    })
+
+                    console.log("WAITING FOR PC CONNECTION")
+
+                    await new Promise((resolve, reject) => {
+                        pc.onconnectionstatechange = (e) => {
+                            if(pc.connectionState === "connected") resolve();
+                            if(pc.connectionState === "failed") reject();
+                        }
+                    })
+
+                    console.log("RTC ESTABLISHED");
+
+                    this.stage = "call"
+                    this.ws = ws;
+                    this.pc = pc;
+                    this.audioTransceiver = audioTransceiver;
+                },
+                async joinVoice() {
+                    const devices = await navigator.mediaDevices.enumerateDevices();
+
+                    const audioDevices = devices.filter(device => device.kind === "audioinput");
+
+                    const id = audioDevices[0].deviceId;
+
+                    const audioStream = await navigator.mediaDevices.getUserMedia({
+                        audio: {
+                            deviceId: id
+                        }
+                    })
+
+                    const audioTransceiver = this.audioTransceiver;
+                    const pc = this.pc;
+
+                    const track = audioStream.getAudioTracks()[0];
+
+                    await audioTransceiver.sender.replaceTrack(track);            
+
+                    const activeTransceiver = pc.getTransceivers().find(tr => tr.mid !== null);
+
+                    const stream = new MediaStream([activeTransceiver.receiver.track]);
+
+                    this.$refs.audio.srcObject = stream;
+                }
+            },
+        }).mount("#root")
+    </script>
+    <style>
+        * {
+            box-sizing: border-box;
+            
+            font-family: "Tiny5", sans-serif;
+            font-weight: 400;
+            font-style: normal;
+
+            color: white;
+        }
+        body {
+            margin: 0;
+            padding: 0;
+
+            background-color: black;
+        }
+
+        #root {
+            width: 100vw;
+            height: 100vh;
+
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .form {
+            position: relative;
+
+            width: 400px;
+
+            border: 2px dashed white;
+            border-radius: 10px;
+
+            padding: 10px;
+
+            font-size: 20px;
+        }
+
+        .form h2 {
+            position: absolute;
+            width: 100%;
+            bottom: 100%;
+            left: 0;
+            text-align: center;
+            font-size: 36px;
+
+            margin: 0 0 10px;
+        }
+
+        button {
+            display: block;
+
+            border: 2px solid white;
+            border-radius: 10px;
+
+            cursor: pointer;
+
+            background-color: black;
+        }
+
+        label {
+            display: block;
+        }
+
+        input {
+            display: block;
+
+            border: 2px solid white;
+            border-radius: 10px;
+
+            width: 100%;
+
+            padding: 5px 10px;
+
+            font-size: 20px;
+            color: black;
+
+            outline: none;
+        }
+    </style>
+</body>
+</html>
