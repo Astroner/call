@@ -195,17 +195,8 @@
             pc.addEventListener('icecandidate', (e) => {
                 if(e.candidate) {
                     result.push(e.candidate);
-                }
-            })
-
-            pc.addEventListener('icegatheringstatechange', (e) => {
-                switch(e.target.iceGatheringState) {
-                    case "gathering":
-                        return;
-
-                    case "complete":
-                        resolve(result);
-                        return;
+                } else {
+                    resolve(result)
                 }
             })
         })
