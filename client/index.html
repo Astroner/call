@@ -37,7 +37,7 @@
         <div v-if="stage === 'call'" class="form">
             <h2>Call</h2>
             <audio ref="audio" autoplay></audio>
-            <button @click="joinVoice">Join voice chat</button>
+            <button v-if="!voiceJoined" @click="joinVoice">Join voice chat</button>
         </div>
     </div>
     <script>
@@ -209,6 +209,7 @@
                     roomPasscode: null,
                     enteredRoomCode: "",
                     enteredRoomPasscode: "",
+                    voiceJoined: false
                 }
             },
             methods: {
@@ -229,8 +230,8 @@
 
                     let theirPublicKey;
                     console.log("WAITING FOR THE OTHER SIDE");
-                    try {
-                        while(true) {
+                    while(!theirPublicKey) {
+                        try {
                             const theirPublicKeyRaw = await waitForWSEncryptedMessage(ws, tempoKey);
 
                             theirPublicKey = await crypto.subtle.importKey(
@@ -245,12 +246,10 @@
 
                             console.log("    CORRECT");
                             ws.send("correct");
-                            break;
+                        } catch(e) {
+                            console.log("   FAILED AUTH ATTEMPT")
                         }
-                    } catch(e) {
-                        console.log("   FAILED AUTH ATTEMPT")
                     }
-
                     this.stage = "loading";
 
                     console.log("OTHER SIDE CONFIRM", theirPublicKey);
@@ -274,8 +273,12 @@
                     console.log("SESSION ESTABLISHED", sessionKey);
 
                     const pc = await createPC();
-                    const audioTransceiver = pc.addTransceiver("audio");
-
+                    pc.addTransceiver("audio", {
+                        direction: "sendonly"
+                    });
+                    pc.addTransceiver("audio", {
+                        direction: "recvonly"
+                    });
 
                     const offer = await pc.createOffer();
                     await pc.setLocalDescription(offer);
@@ -310,7 +313,7 @@
                     this.stage = "call";
                     this.ws = ws;
                     this.pc = pc;
-                    this.audioTransceiver = audioTransceiver;
+                    this.pcType = "host";
                 },
                 async connect() {
                     if(!this.enteredRoomCode || !this.enteredRoomPasscode) return;
@@ -388,7 +391,9 @@
                     console.log("SESSION ESTABLISHED", sessionKey);
 
                     const pc = await createPC();
-                    const audioTransceiver = pc.addTransceiver("audio");
+                    pc.addTransceiver("audio", {
+                        direction: "sendonly"
+                    });
 
                     console.log("WAITING FOR OFFER");
 
@@ -427,9 +432,10 @@
                     this.stage = "call"
                     this.ws = ws;
                     this.pc = pc;
-                    this.audioTransceiver = audioTransceiver;
+                    this.pcType = "guest";
                 },
                 async joinVoice() {
+                    this.voiceJoined = true;
                     const devices = await navigator.mediaDevices.enumerateDevices();
 
                     const audioDevices = devices.filter(device => device.kind === "audioinput");
@@ -442,18 +448,27 @@
                         }
                     })
 
-                    const audioTransceiver = this.audioTransceiver;
-                    const pc = this.pc;
-
                     const track = audioStream.getAudioTracks()[0];
 
-                    await audioTransceiver.sender.replaceTrack(track);            
+                    const pc = this.pc;
+                    const transceivers = pc.getTransceivers();
 
-                    const activeTransceiver = pc.getTransceivers().find(tr => tr.mid !== null);
+                    for(const transceiver of pc.getTransceivers()) {
+                        if(transceiver.currentDirection === "inactive") continue;
 
-                    const stream = new MediaStream([activeTransceiver.receiver.track]);
+                        if(transceiver.direction === "sendonly") {
+                            transceiver.sender.replaceTrack(track, audioStream);
+                            continue;
+                        }
 
-                    this.$refs.audio.srcObject = stream;
+                        if(transceiver.direction === "recvonly") {
+                            this.$refs.audio.srcObject = new MediaStream([transceiver.receiver.track]);
+                        }
+                    }
+
+                    // await outAudioTransceiver.sender.replaceTrack(track, audioStream);            
+
+                    // this.$refs.audio.srcObject = new MediaStream([inAudioTransceiver.receiver.track]);
                 }
             },
         }).mount("#root")
