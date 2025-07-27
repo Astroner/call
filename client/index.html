@@ -37,7 +37,7 @@
         <div v-if="stage === 'call'" class="form">
             <h2>Call</h2>
             <audio ref="audio" autoplay></audio>
-            <button @click="joinVoice">Join voice chat</button>
+            <button v-if="!voiceJoined" @click="joinVoice">Join voice chat</button>
         </div>
     </div>
     <script>
@@ -195,17 +195,8 @@
             pc.addEventListener('icecandidate', (e) => {
                 if(e.candidate) {
                     result.push(e.candidate);
-                }
-            })
-
-            pc.addEventListener('icegatheringstatechange', (e) => {
-                switch(e.target.iceGatheringState) {
-                    case "gathering":
-                        return;
-
-                    case "complete":
-                        resolve(result);
-                        return;
+                } else {
+                    resolve(result)
                 }
             })
         })
@@ -218,6 +209,7 @@
                     roomPasscode: null,
                     enteredRoomCode: "",
                     enteredRoomPasscode: "",
+                    voiceJoined: false
                 }
             },
             methods: {
@@ -238,8 +230,8 @@
 
                     let theirPublicKey;
                     console.log("WAITING FOR THE OTHER SIDE");
-                    try {
-                        while(true) {
+                    while(!theirPublicKey) {
+                        try {
                             const theirPublicKeyRaw = await waitForWSEncryptedMessage(ws, tempoKey);
 
                             theirPublicKey = await crypto.subtle.importKey(
@@ -254,12 +246,10 @@
 
                             console.log("    CORRECT");
                             ws.send("correct");
-                            break;
+                        } catch(e) {
+                            console.log("   FAILED AUTH ATTEMPT")
                         }
-                    } catch(e) {
-                        console.log("   FAILED AUTH ATTEMPT")
                     }
-
                     this.stage = "loading";
 
                     console.log("OTHER SIDE CONFIRM", theirPublicKey);
@@ -282,9 +272,15 @@
 
                     console.log("SESSION ESTABLISHED", sessionKey);
 
-                    const pc = await createPC();
-                    const audioTransceiver = pc.addTransceiver("audio");
+                    const ac = new AudioContext();
+                    const dest = ac.createMediaStreamDestination();
+                    // No source connected -> silent track
+                    const silentTrack = dest.stream.getAudioTracks()[0];
 
+                    const pc = await createPC();
+                    const trs = pc.addTransceiver("audio", { direction: "sendrecv" });
+                    await trs.sender.setStreams(dest.stream);
+                    await trs.sender.replaceTrack(silentTrack);
 
                     const offer = await pc.createOffer();
                     await pc.setLocalDescription(offer);
@@ -319,7 +315,7 @@
                     this.stage = "call";
                     this.ws = ws;
                     this.pc = pc;
-                    this.audioTransceiver = audioTransceiver;
+                    this.pcType = "host";
                 },
                 async connect() {
                     if(!this.enteredRoomCode || !this.enteredRoomPasscode) return;
@@ -397,7 +393,6 @@
                     console.log("SESSION ESTABLISHED", sessionKey);
 
                     const pc = await createPC();
-                    const audioTransceiver = pc.addTransceiver("audio");
 
                     console.log("WAITING FOR OFFER");
 
@@ -406,8 +401,16 @@
                     console.log("OFFER AND CANDIDATES RECEIVED", offer, candidates);
 
                     await pc.setRemoteDescription(offer);
-
                     candidates.forEach(candidate => pc.addIceCandidate(candidate));
+
+                    const trs = pc.getTransceivers()[0];
+                    trs.direction = "sendrecv";
+
+                    const ac = new AudioContext();
+                    const dest = ac.createMediaStreamDestination();
+                    // No source connected -> silent track
+                    const silentTrack = dest.stream.getAudioTracks()[0];
+                    trs.sender.replaceTrack(silentTrack);
 
                     const answer = await pc.createAnswer();
                     console.log("ANSWER CREATED", answer);
@@ -436,9 +439,10 @@
                     this.stage = "call"
                     this.ws = ws;
                     this.pc = pc;
-                    this.audioTransceiver = audioTransceiver;
+                    this.pcType = "guest";
                 },
                 async joinVoice() {
+                    this.voiceJoined = true;
                     const devices = await navigator.mediaDevices.enumerateDevices();
 
                     const audioDevices = devices.filter(device => device.kind === "audioinput");
@@ -451,18 +455,13 @@
                         }
                     })
 
-                    const audioTransceiver = this.audioTransceiver;
-                    const pc = this.pc;
-
                     const track = audioStream.getAudioTracks()[0];
 
-                    await audioTransceiver.sender.replaceTrack(track);            
+                    const pc = this.pc;
+                    const transceiver = pc.getTransceivers()[0];
 
-                    const activeTransceiver = pc.getTransceivers().find(tr => tr.mid !== null);
-
-                    const stream = new MediaStream([activeTransceiver.receiver.track]);
-
-                    this.$refs.audio.srcObject = stream;
+                    await transceiver.sender.replaceTrack(track);
+                    this.$refs.audio.srcObject = new MediaStream([transceiver.receiver.track]);
                 }
             },
         }).mount("#root")
