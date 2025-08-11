@@ -6,41 +6,8 @@
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Tiny5&display=swap" rel="stylesheet">
     <title>Chat</title>
-</head>
-<body>
-    <div id="root">
-        <form v-if="stage === 'init'" class="form" @submit.prevent="connect">
-            <h2>Chat room</h2>
-            <label>
-                Room code
-                <input v-model="enteredRoomCode">
-            </label>
-            <label>
-                Room passcode
-                <input v-model="enteredRoomPasscode">
-            </label>
-            <button type="submit">Connect</button>
-            <br>
-            <button @click="create">Create room</button>
-        </form>
-        <div v-if="stage === 'loading'" class="form">
-            Loading
-        </div>
-        <div v-if="stage === 'room-code'" class="form">
-            <div>
-                Room code: {{ roomCode }}
-            </div>
-            <div>
-                Room passcode: {{ roomPasscode }}
-            </div>
-        </div>
-        <div v-if="stage === 'call'" class="form">
-            <h2>Call</h2>
-            <audio ref="audio" autoplay></audio>
-            <button v-if="!voiceJoined" @click="joinVoice">Join voice chat</button>
-        </div>
-    </div>
     <script>
+        // utils
         const encoder = new TextEncoder();
         const decoder = new TextDecoder();
 
@@ -200,7 +167,64 @@
                 }
             })
         })
+    </script>
+</head>
+<body>
+    <div id="root">
+        <form v-if="stage === 'init'" class="form" @submit.prevent="connect">
+            <h2>Chat room</h2>
+            <label>
+                Room code
+                <input v-model="enteredRoomCode">
+            </label>
+            <label>
+                Room passcode
+                <input v-model="enteredRoomPasscode">
+            </label>
+            <button type="submit" style="width: 100%; font-size: 20px; margin-top: 10px;">Connect</button>
+            <button @click="create" style="width: 100%; font-size: 20px; margin-top: 10px;">Create room</button>
+        </form>
+        <div v-if="stage === 'loading'" class="form">
+            Loading
+        </div>
+        <div v-if="stage === 'room-code'" class="form">
+            <div>
+                Room code: {{ roomCode }}
+            </div>
+            <div>
+                Room passcode: {{ roomPasscode }}
+            </div>
+        </div>
+        <div v-if="stage === 'call'" class="form">
+            <h2>Call</h2>
+            <audio ref="audio" autoplay></audio>
+            <div class="ping">Ping: {{ callState.ping }}ms</div>
+            <div v-if="callState.hasAudio" style="display: flex; align-items: center;">
+                <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="#e3e3e3">
+                    <path d="M200-360v-240h160l200-200v640L360-360H200Zm440 40v-322q45 21 72.5 65t27.5 97q0 53-27.5 96T640-320ZM480-606l-86 86H280v80h114l86 86v-252ZM380-480Z"/>
+                </svg>
+                <div ref="volume" class="volume-input" @click="setVolume">
+                    <div class="volume-white" :style="{ width: `calc(${callState.volume * 100}% - 2px)` }">
+                        
+                    </div>
+                    <div class="volume-control" :style="{ left: `calc(${callState.volume * 100}% - 6px)` }"></div>
+                    <div class="volume-level" :style="{ width: `${callState.incomingAudioLevel * 100}%` }">
 
+                    </div>
+                </div>
+            </div>
+            <div v-else style="width: 100%; text-align: center;">
+                The other side did not join the audio
+            </div>
+            <button 
+                @click="voiceJoined ? leaveAudio() : joinVoice()"
+                style="width: 100%; font-size: 20px; margin-top: 10px;"
+            >
+                {{ voiceJoined ? "Leave audio" : "Join audio" }}
+            </button>
+        </div>
+    </div>
+    <script>
         Vue.createApp({
             data() {
                 return {
@@ -209,7 +233,18 @@
                     roomPasscode: null,
                     enteredRoomCode: "",
                     enteredRoomPasscode: "",
-                    voiceJoined: false
+                    voiceJoined: false,
+                    callState: {
+                        ping: 0,
+                        hasAudio: false,
+                        volume: .5,
+                        incomingAudioLevel: 0,
+                    }
+                }
+            },
+            watch: {
+                'callState.volume'(value) {
+                    this.$refs.audio.volume = value;
                 }
             },
             methods: {
@@ -272,15 +307,8 @@
 
                     console.log("SESSION ESTABLISHED", sessionKey);
 
-                    const ac = new AudioContext();
-                    const dest = ac.createMediaStreamDestination();
-                    // No source connected -> silent track
-                    const silentTrack = dest.stream.getAudioTracks()[0];
-
                     const pc = await createPC();
-                    const trs = pc.addTransceiver("audio", { direction: "sendrecv" });
-                    await trs.sender.setStreams(dest.stream);
-                    await trs.sender.replaceTrack(silentTrack);
+                    pc.addTransceiver("audio", { direction: "sendrecv" });
 
                     const offer = await pc.createOffer();
                     await pc.setLocalDescription(offer);
@@ -298,7 +326,7 @@
                     console.log("ANSWER AND CANDIDATES RECEIVED", { answer, candidates });
 
                     await pc.setRemoteDescription(answer);
-                    candidates.forEach(candidate => pc.addIceCandidate(candidate));
+                    await Promise.all(candidates.map(candidate => pc.addIceCandidate(candidate)));
 
 
                     console.log("WAITING FOR PC CONNECTION")
@@ -316,6 +344,8 @@
                     this.ws = ws;
                     this.pc = pc;
                     this.pcType = "host";
+
+                    this.setupCall();
                 },
                 async connect() {
                     if(!this.enteredRoomCode || !this.enteredRoomPasscode) return;
@@ -401,16 +431,10 @@
                     console.log("OFFER AND CANDIDATES RECEIVED", offer, candidates);
 
                     await pc.setRemoteDescription(offer);
-                    candidates.forEach(candidate => pc.addIceCandidate(candidate));
+                    await Promise.all(candidates.map(candidate => pc.addIceCandidate(candidate)))
 
                     const trs = pc.getTransceivers()[0];
                     trs.direction = "sendrecv";
-
-                    const ac = new AudioContext();
-                    const dest = ac.createMediaStreamDestination();
-                    // No source connected -> silent track
-                    const silentTrack = dest.stream.getAudioTracks()[0];
-                    trs.sender.replaceTrack(silentTrack);
 
                     const answer = await pc.createAnswer();
                     console.log("ANSWER CREATED", answer);
@@ -440,9 +464,43 @@
                     this.ws = ws;
                     this.pc = pc;
                     this.pcType = "guest";
+
+                    this.setupCall();
+                },
+                async setupCall() {
+                    /**
+                     * @type {RTCPeerConnection}
+                     */
+                    let pc = this.pc;
+
+                    const [transceiver] = pc.getTransceivers();
+                    setTimeout(() => this.$refs.audio.srcObject = new MediaStream([transceiver.receiver.track]), 0);
+
+                    let receivedAudio = false;
+                    this.statsInterval = setInterval(async () => {
+                        const stats = await pc.getStats();
+                        for(const report of stats.values()) {
+                            if(report.type === "candidate-pair") {   
+                                if("currentRoundTripTime" in report) {
+                                    this.callState.ping = Math.floor(report.currentRoundTripTime * 1000);
+                                }
+                                continue;
+                            }
+
+                            if(report.type === "inbound-rtp") {
+                                if(!receivedAudio && report.bytesReceived > 0) {
+                                    receivedAudio = true;
+                                    this.callState.hasAudio = true;
+                                }
+
+                                this.callState.incomingAudioLevel = report.audioLevel;
+
+                                continue;
+                            }
+                        }
+                    }, 250)
                 },
                 async joinVoice() {
-                    this.voiceJoined = true;
                     const devices = await navigator.mediaDevices.enumerateDevices();
 
                     const audioDevices = devices.filter(device => device.kind === "audioinput");
@@ -458,10 +516,24 @@
                     const track = audioStream.getAudioTracks()[0];
 
                     const pc = this.pc;
-                    const transceiver = pc.getTransceivers()[0];
+                    const [transceiver] = pc.getTransceivers();
 
                     await transceiver.sender.replaceTrack(track);
-                    this.$refs.audio.srcObject = new MediaStream([transceiver.receiver.track]);
+                    this.voiceJoined = true;
+                },
+                async leaveAudio() {
+                    const pc = this.pc;
+                    const [transceiver] = pc.getTransceivers();
+
+                    await transceiver.sender.replaceTrack(null);
+                    this.voiceJoined = false;
+                },
+                async setVolume(e) {
+                    const rect = this.$refs.volume.getBoundingClientRect()
+                    const x = e.clientX - rect.left;
+                    const ratio = x / rect.width;
+
+                    this.callState.volume = ratio;
                 }
             },
         }).mount("#root")
@@ -545,6 +617,56 @@
             color: black;
 
             outline: none;
+        }
+
+        .ping {
+            position: absolute;
+            right: 0;
+            bottom: calc(100% + 15px);
+        }
+
+        .volume-input {
+            position: relative;
+
+            width: 100%;
+            height: 20px;
+
+            border: 2px solid white;
+            border-radius: 5px;
+
+            cursor: pointer;
+        }
+
+        .volume-white {
+            background: white;
+            height: 100%;
+        }
+
+        .volume-control {
+            position: absolute;
+            top: 2px;
+
+            height: calc(100% - 4px);
+            width: 7px;
+
+            background-color: #fff;
+
+            border-radius: 5px;
+            border: 2px solid black;
+        }
+
+        .volume-level {
+            position: absolute;
+            top: 0;
+            left: 0;
+
+            height: 100%;
+
+            background-color: rgba(0, 0, 0, .3);
+
+            transition: width .3s;
+
+            border-radius: 0 5px 5px 0;
         }
     </style>
 </body>
